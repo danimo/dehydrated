@@ -132,7 +132,7 @@ load_config() {
     echo "# !! WARNING !! No main config file found, using default config!" >&2
     echo "#" >&2
   elif [[ -f "${CONFIG}" ]]; then
-    echo "# INFO: Using main config file ${CONFIG}"
+    echo "# INFO: Using main config file ${CONFIG}" >&2
     BASEDIR="$(dirname "${CONFIG}")"
     # shellcheck disable=SC1090
     . "${CONFIG}"
@@ -903,6 +903,108 @@ command_sign_domains() {
   exit 0
 }
 
+# Usage: --to-json (-j)
+# Description: Display all issued certificates
+command_to_json() {
+  init_system
+
+  if [[ -n "${PARAM_DOMAIN:-}" ]]; then
+    DOMAINS_TXT="$(_mktemp)"
+    printf -- "${PARAM_DOMAIN}" > "${DOMAINS_TXT}"
+  elif [[ -e "${DOMAINS_TXT}" ]]; then
+    if [[ ! -r "${DOMAINS_TXT}" ]]; then
+      _exiterr "domains.txt found but not readable"
+    fi
+  else
+    _exiterr "domains.txt not found and --domain not given"
+  fi
+
+  # Generate certificates for all domains found in domains.txt. Check if existing certificate are about to expire
+  ORIGIFS="${IFS}"
+  IFS=$'\n'
+  json=""
+
+  for line in $(<"${DOMAINS_TXT}" tr -d '\r' | awk '{print tolower($0)}' | _sed -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g' -e 's/[[:space:]]+/ /g' | (grep -vE '^(#|$)' || true)); do
+    reset_configvars
+    IFS="${ORIGIFS}"
+    domain="$(printf '%s\n' "${line}" | cut -d' ' -f1)"
+    morenames="$(printf '%s\n' "${line}" | cut -s -d' ' -f2-)"
+    cert="${CERTDIR}/${domain}/cert.pem"
+
+    force_renew="${PARAM_FORCE:-no}"
+
+    # read cert config
+    # for now this loads the certificate specific config in a subshell and parses a diff of set variables.
+    # we could just source the config file but i decided to go this way to protect people from accidentally overriding
+    # variables used internally by this script itself.
+    if [[ -n "${DOMAINS_D}" ]]; then
+      certconfig="${DOMAINS_D}/${domain}"
+    else
+      certconfig="${CERTDIR}/${domain}/config"
+    fi
+
+    if [ -f "${certconfig}" ]; then
+      echo " + Using certificate specific config file!"
+      ORIGIFS="${IFS}"
+      IFS=$'\n'
+      for cfgline in $(
+        beforevars="$(_mktemp)"
+        aftervars="$(_mktemp)"
+        set > "${beforevars}"
+        # shellcheck disable=SC1090
+        . "${certconfig}"
+        set > "${aftervars}"
+        diff -u "${beforevars}" "${aftervars}" | grep -E '^\+[^+]'
+        rm "${beforevars}"
+        rm "${aftervars}"
+      ); do
+        config_var="$(echo "${cfgline:1}" | cut -d'=' -f1)"
+        config_value="$(echo "${cfgline:1}" | cut -d'=' -f2-)"
+        case "${config_var}" in
+          KEY_ALGO|OCSP_MUST_STAPLE|PRIVATE_KEY_RENEW|PRIVATE_KEY_ROLLOVER|KEYSIZE|CHALLENGETYPE|HOOK|WELLKNOWN|HOOK_CHAIN|OPENSSL_CNF|RENEW_DAYS)
+            echo "   + ${config_var} = ${config_value}"
+            declare -- "${config_var}=${config_value}"
+            ;;
+          _) ;;
+          *) echo "   ! Setting ${config_var} on a per-certificate base is not (yet) supported"
+        esac
+      done
+      IFS="${ORIGIFS}"
+    fi
+    verify_config
+    export WELLKNOWN CHALLENGETYPE KEY_ALGO PRIVATE_KEY_ROLLOVER
+
+    certnames=
+    requestednames="$(echo "${domain}" "${morenames}"| tr ' ' '\n' | sort -u | tr '\n' ' ' | _sed 's/ $//' | _sed 's/^ //')"
+
+    if [[ -e "${cert}" ]]; then
+      certnames="$(openssl x509 -in "${cert}" -text -noout | grep DNS: | _sed 's/DNS://g' | tr -d ' ' | tr ',' '\n' | sort -u | tr '\n' ' ' | _sed 's/ $//')"
+
+      if [[ "${certnames}" = "${givennames}" ]]; then
+        force_renew="no"
+      else
+        force_renew="yes"
+      fi
+    fi
+
+    valid=
+    if [[ -e "${cert}" ]]; then
+      valid="$(openssl x509 -enddate -noout -in "${cert}" | cut -d= -f2- )"
+    fi
+    [ -n "$json" ] && json="$json, "
+    json="$json{ \"domain\": \"$domain\", \"morenames\": \"$morenames\", \"certnames\": \"$certnames\", \"requestednames\": \"$requestednames\", \"certpath\": \"$cert\", \"valid\": \"$valid\", \"needs_renewal\": \"$force_renew\" }"
+
+  done
+
+  echo "[ $json ]"
+
+    # remove temporary domains.txt file if used
+  [[ -n "${PARAM_DOMAIN:-}" ]] && rm -f "${DOMAINS_TXT}"
+
+  [[ -n "${HOOK}" ]] && "${HOOK}" "exit_hook"
+  exit 0
+}
+
 # Usage: --signcsr (-s) path/to/csr.pem
 # Description: Sign a given CSR, output CRT on stdout (advanced usage)
 command_sign_csr() {
@@ -1101,6 +1203,10 @@ main() {
         set_command sign_domains
         ;;
 
+      --to-json|-j)
+        set_command to_json
+        ;;
+
       --register)
         set_command register
         ;;
@@ -1253,6 +1359,7 @@ main() {
   case "${COMMAND}" in
     env) command_env;;
     sign_domains) command_sign_domains;;
+    to_json) command_to_json;;
     register) command_register;;
     sign_csr) command_sign_csr "${PARAM_CSR}";;
     revoke) command_revoke "${PARAM_REVOKECERT}";;
